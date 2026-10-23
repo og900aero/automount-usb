@@ -1,0 +1,7 @@
+# usb-automount: USB-s, fájlrendszert tartalmazó blokkeszközök (partíció vagy
+# partíció nélküli pendrive) bedugásakor elindítja a usb-automount@<név>.service-t.
+# Az USB-t a szülőeszköz alapján ismeri fel (SUBSYSTEMS=="usb"), nem az ID_BUS-ból,
+# mert UAS-os SSD-knél és SATA-hidas USB-s lemezeknél az ID_BUS gyakran "ata".
+# Kihúzáskor a service BindsTo= miatt magától leáll (és lecsatol), külön
+# remove szabály nem kell.
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[a-z]*", SUBSYSTEMS=="usb", ENV{ID_FS_USAGE}=="filesystem", ENV{UDISKS_IGNORE}!="1", TAG+="systemd", ENV{SYSTEMD_WANTS}+="usb-automount@%k.service"

@@ -1,0 +1,12 @@
+[Unit]
+Description=USB automount: /dev/%i
+# Az eszköz eltűnésekor (kihúzás) a service leáll -> ExecStop lecsatol.
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/usb-automount add %i
+ExecStop=/usr/local/sbin/usb-automount remove %i
+TimeoutSec=90

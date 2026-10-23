@@ -1,0 +1,272 @@
+#!/bin/bash
+# usb-automount — USB-s fájlrendszerek automatikus csatolása udev + systemd alapon.
+#
+# A usb-automount@<kernelnév>.service indítja root-ként (lásd 99-usb-automount.rules).
+#   usb-automount add sdb1      -> csatolás /media/<user>/<címke> alá
+#   usb-automount remove sdb1   -> lecsatolás, mountpont törlése
+#
+# Biztonsági alapelvek:
+#   - a fájlrendszer címkéje / típusa SOHA nem kerül eval-ba vagy shell-parancsba,
+#   - a címkéből csak [A-Za-z0-9._-] marad, nincs '/' és nincs vezető pont,
+#   - mindig nosuid,nodev (alapból noexec is),
+#   - csak engedélyezett fájlrendszer-típusok, csak USB-s eszközök,
+#   - a mountpontok szülőkönyvtára root tulajdonú és csak root írhatja.
+#
+# X11 és Wayland alatt ugyanúgy működik: a felhasználót a logind-től kérdezi
+# (seat0 aktív sessionje), az értesítést a felhasználó D-Bus session buszán küldi,
+# DISPLAY / WAYLAND_DISPLAY nem kell hozzá.
+
+set -u
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+umask 022
+
+CONF=/etc/usb-automount.conf
+STATE_DIR=/run/usb-automount
+
+# ---- alapértékek (felülírhatók a /etc/usb-automount.conf-ban) -------------
+MOUNT_USER=""           # üres = a seat0 aktív sessionjének felhasználója
+MOUNT_BASE=/media       # a mountpont: $MOUNT_BASE/<user>/<címke>
+NOEXEC=yes              # yes = noexec opció (programok nem futtathatók a pendrive-ról)
+NOTIFY=yes              # asztali értesítés notify-send-del
+ALLOWED_FS="vfat exfat ntfs ext2 ext3 ext4 btrfs xfs f2fs iso9660 udf"
+
+log() { printf '%s\n' "$*" >&2; }   # a journalba kerül: journalctl -u 'usb-automount@*'
+
+load_config() {
+    # Csak root tulajdonú, mások által nem írható konfigot olvasunk be.
+    [[ -f $CONF && ! -L $CONF ]] || return 0
+    local owner perm
+    owner=$(stat -c %u "$CONF") perm=$(stat -c %a "$CONF")
+    if [[ $owner != 0 ]] || (( 8#$perm & 8#022 )); then
+        log "WARN: $CONF nem root tulajdonú vagy mások által írható, kihagyva"
+        return 0
+    fi
+    # shellcheck source=/dev/null
+    . "$CONF"
+}
+
+# Az udev adatbázisból olvassa az eszköz tulajdonságait a P asszociatív tömbbe.
+# Nincs eval: minden sor KULCS=ÉRTÉK, az értéket szövegként tároljuk.
+declare -A P=()
+read_props() {
+    local dev=$1 line
+    P=()
+    while IFS= read -r line; do
+        [[ $line == *=* ]] || continue
+        P[${line%%=*}]=${line#*=}
+    done < <(udevadm info --query=property --name="$dev" 2>/dev/null)
+}
+
+# Biztonságos könyvtárnév a címkéből.
+sanitize_label() {
+    local s=$1
+    s=${s//[^A-Za-z0-9._-]/_}
+    while [[ $s == .* ]]; do s=${s#.}; done
+    s=${s:0:48}
+    printf '%s' "$s"
+}
+
+# Melyik felhasználó kapja a csatolt eszközt?
+find_user() {
+    local u=$MOUNT_USER s
+    if [[ -z $u ]]; then
+        s=$(loginctl show-seat seat0 --property=ActiveSession --value 2>/dev/null)
+        [[ -n $s ]] && u=$(loginctl show-session "$s" --property=Name --value 2>/dev/null)
+    fi
+    [[ -n $u ]] && id -u -- "$u" >/dev/null 2>&1 || return 1
+    printf '%s' "$u"
+}
+
+# A mountpontok szülőkönyvtára: root:root, más nem írhatja (különben symlink-csere
+# támadással a mount máshová is mehetne).
+prepare_base() {
+    local dir=$1
+    if [[ ! -e $dir ]]; then
+        mkdir -p -- "$dir" || return 1
+        chown root:root -- "$dir"
+    fi
+    [[ -d $dir && ! -L $dir ]] || { log "ERROR: $dir nem könyvtár"; return 1; }
+    local owner perm
+    owner=$(stat -c %u "$dir") perm=$(stat -c %a "$dir")
+    if [[ $owner != 0 ]] || (( 8#$perm & 8#022 )); then
+        log "ERROR: $dir nem root tulajdonú vagy mások által írható — nem csatolok bele"
+        return 1
+    fi
+}
+
+notify() {
+    [[ $NOTIFY == yes && -n ${NOTIFY_USER:-} ]] || return 0
+    command -v notify-send >/dev/null || return 0
+    local uid bus
+    uid=$(id -u -- "$NOTIFY_USER") || return 0
+    bus=/run/user/$uid/bus
+    [[ -S $bus ]] || return 0
+    timeout 5 runuser -u "$NOTIFY_USER" -- env \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$bus" XDG_RUNTIME_DIR="/run/user/$uid" \
+        notify-send -a usb-automount -i drive-removable-media -- "$@" >/dev/null 2>&1 || true
+}
+
+fs_allowed() {
+    local t
+    for t in $ALLOWED_FS; do [[ $t == "$1" ]] && return 0; done
+    return 1
+}
+
+# Csatolási opciók és mount típus fájlrendszerenként -> MTYPE, OPTS
+build_opts() {
+    local type=$1 uid=$2 gid=$3
+    local base="nosuid,nodev"
+    [[ $NOEXEC == yes ]] && base+=",noexec"
+    MTYPE=$type
+    OPTS="rw,relatime,$base"
+    case $type in
+        vfat)
+            OPTS+=",uid=$uid,gid=$gid,fmask=0133,dmask=0022,utf8,shortname=mixed,flush" ;;
+        exfat)
+            OPTS+=",uid=$uid,gid=$gid,fmask=0133,dmask=0022" ;;
+        ntfs)
+            # Kernel ntfs3 driver, ha van; különben ntfs-3g (FUSE).
+            if grep -qw ntfs3 /proc/filesystems 2>/dev/null || modprobe -q ntfs3 2>/dev/null; then
+                MTYPE=ntfs3
+            elif command -v ntfs-3g >/dev/null; then
+                MTYPE=ntfs-3g
+            else
+                return 1
+            fi
+            OPTS+=",uid=$uid,gid=$gid,fmask=0133,dmask=0022" ;;
+        iso9660|udf)
+            OPTS="ro,$base,uid=$uid,gid=$gid" ;;
+        ext2|ext3|ext4|btrfs|xfs|f2fs)
+            : ;;   # Unix jogosultságok a fájlrendszeren — uid= itt nem értelmezett
+        *)
+            return 1 ;;
+    esac
+}
+
+do_add() {
+    local dev=$1 DEVICE=/dev/$1
+
+    read_props "$DEVICE"
+    # USB-s-e: a sysfs útvonalban van usbN szülő (ID_BUS UAS-os eszközöknél gyakran "ata")
+    if [[ ! ${P[DEVPATH]:-} =~ /usb[0-9]+/ || ${P[ID_FS_USAGE]:-} != filesystem ]]; then
+        log "$DEVICE: nem USB-s fájlrendszer, kihagyva"
+        return 0
+    fi
+    local type=${P[ID_FS_TYPE]:-}
+    if ! fs_allowed "$type"; then
+        log "$DEVICE: '$type' fájlrendszer nincs engedélyezve (ALLOWED_FS), kihagyva"
+        return 0
+    fi
+    if findmnt -rn -S "$DEVICE" >/dev/null 2>&1; then
+        log "$DEVICE: már csatolva van"
+        return 0
+    fi
+
+    local user
+    if ! user=$(find_user); then
+        log "$DEVICE: nincs aktív felhasználó (állítsd be: MOUNT_USER a $CONF-ban), nem csatolok"
+        return 0
+    fi
+    NOTIFY_USER=$user
+    local uid gid
+    uid=$(id -u -- "$user") gid=$(id -g -- "$user")
+
+    local MTYPE OPTS
+    if ! build_opts "$type" "$uid" "$gid"; then
+        log "$DEVICE: nincs használható driver a(z) '$type' fájlrendszerhez"
+        notify "USB csatolás sikertelen" "$DEVICE: nincs driver ($type)"
+        return 1
+    fi
+
+    local base=$MOUNT_BASE/$user
+    prepare_base "$MOUNT_BASE" && prepare_base "$base" || return 1
+
+    local name
+    name=$(sanitize_label "${P[ID_FS_LABEL]:-}")
+    [[ -n $name ]] || name=$dev
+
+    # Egyedi, üres, nem csatolt mountpont keresése. mkdir nem követi a symlinket,
+    # és a $base-be csak root írhat, így nincs versenyhelyzet.
+    local mp created=0 cand
+    for cand in "$name" "$name-$dev"; do
+        mp=$base/$cand
+        if mkdir -m 0755 -- "$mp" 2>/dev/null; then
+            created=1; break
+        fi
+        if [[ -d $mp && ! -L $mp ]] && ! mountpoint -q -- "$mp" \
+                && [[ -z $(ls -A -- "$mp") ]]; then
+            break
+        fi
+        mp=""
+    done
+    if [[ -z $mp ]]; then
+        log "$DEVICE: nem találtam szabad mountpontot ($base/$name)"
+        return 1
+    fi
+
+    if ! mount -t "$MTYPE" -o "$OPTS" "$DEVICE" "$mp"; then
+        log "$DEVICE: mount -t $MTYPE -o $OPTS sikertelen"
+        (( created )) && rmdir -- "$mp"
+        notify "USB csatolás sikertelen" "$DEVICE ($type)"
+        return 1
+    fi
+
+    mkdir -p "$STATE_DIR"
+    printf '%s\n%s\n%s\n' "$mp" "$created" "$user" > "$STATE_DIR/$dev"
+    log "$DEVICE ($type) csatolva: $mp  [$MTYPE: $OPTS]"
+    notify "USB csatolva" "$mp"
+}
+
+do_remove() {
+    local dev=$1 DEVICE=/dev/$1
+    local mp="" created=0 user=""
+
+    if [[ -f $STATE_DIR/$dev ]]; then
+        { IFS= read -r mp; IFS= read -r created; IFS= read -r user; } < "$STATE_DIR/$dev"
+    fi
+    [[ -n $mp ]] || mp=$(findmnt -rn -S "$DEVICE" -o TARGET 2>/dev/null | head -n1)
+    NOTIFY_USER=$user
+
+    if [[ -z $mp ]]; then
+        log "$DEVICE: nincs csatolva"
+        rm -f -- "$STATE_DIR/$dev"
+        return 0
+    fi
+
+    if mountpoint -q -- "$mp"; then
+        if ! umount -- "$mp"; then
+            if [[ -b $DEVICE ]]; then
+                # Az eszköz még bent van (usb-eject): nem szabad lazy-vel úgy tenni,
+                # mintha kihúzható lenne, mert a pufferelt írások elveszhetnek.
+                log "$DEVICE: foglalt, nem csatolható le (fuser -vm $mp)"
+                notify "USB foglalt" "$mp — zárd be, ami használja"
+                return 1
+            fi
+            log "$DEVICE: az eszköz már eltűnt, lazy unmount"
+            umount -l -- "$mp" || { log "$DEVICE: lecsatolás sikertelen"; return 1; }
+        fi
+    fi
+    if [[ $created == 1 ]] && ! mountpoint -q -- "$mp"; then
+        rmdir -- "$mp" 2>/dev/null
+    fi
+    rm -f -- "$STATE_DIR/$dev"
+    log "$DEVICE lecsatolva: $mp"
+    notify "USB lecsatolva" "$mp — kihúzható"
+}
+
+main() {
+    if [[ $# -ne 2 || ! $2 =~ ^sd[a-z]+[0-9]*$ ]]; then
+        log "Használat: $0 {add|remove} <kernelnév, pl. sdb1>"
+        exit 2
+    fi
+    [[ $EUID -eq 0 ]] || { log "root jog kell"; exit 1; }
+    load_config
+    case $1 in
+        add)    do_add "$2" ;;
+        remove) do_remove "$2" ;;
+        *)      log "Ismeretlen művelet: $1"; exit 2 ;;
+    esac
+}
+
+# Teszteléshez be lehet source-olni a függvényeket futtatás nélkül.
+[[ ${BASH_SOURCE[0]} == "$0" ]] && main "$@"
